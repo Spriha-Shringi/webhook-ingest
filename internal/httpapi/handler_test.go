@@ -68,6 +68,21 @@ func TestWebhookRejectsUnknownStatus(t *testing.T) {
 	}
 }
 
+func TestWebhookSuccessRespondsJSON(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+
+	body := fmt.Sprintf(`{"event_id":%q,"call_id":%q,"account_id":%q,"status":"completed","duration_sec":10}`,
+		eventID, callID, accountID)
+	resp := post(t, srv.URL+"/webhooks/calls", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type is %q, want application/json", ct)
+	}
+}
+
 func TestAccountStatsEndpointRespondsJSON(t *testing.T) {
 	srv, st := testutil.NewServer(t)
 	_, _, accountID := testutil.IDs(t, st)
