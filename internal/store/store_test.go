@@ -8,7 +8,7 @@ import (
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
-func TestInsertEventThenExists(t *testing.T) {
+func TestProcessDeliveryStoresEventAndCall(t *testing.T) {
 	s := testutil.NewStore(t)
 	eventID, callID, accountID := testutil.IDs(t, s)
 	ctx := context.Background()
@@ -18,28 +18,12 @@ func TestInsertEventThenExists(t *testing.T) {
 		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
 	}
 
-	exists, err := s.EventExists(ctx, eventID)
-	if err != nil {
-		t.Fatalf("EventExists: %v", err)
-	}
-	if exists {
-		t.Fatal("expected event to be absent before insert")
-	}
-
-	if err := s.InsertEvent(ctx, evt); err != nil {
-		t.Fatalf("InsertEvent: %v", err)
-	}
-
-	exists, err = s.EventExists(ctx, eventID)
-	if err != nil {
-		t.Fatalf("EventExists: %v", err)
-	}
-	if !exists {
-		t.Fatal("expected event to exist after insert")
+	if _, inserted, err := s.ProcessDelivery(ctx, evt); err != nil || !inserted {
+		t.Fatalf("ProcessDelivery = inserted:%t err:%v, want inserted", inserted, err)
 	}
 }
 
-func TestInsertEventRejectsDuplicateEventID(t *testing.T) {
+func TestProcessDeliveryIgnoresDuplicateEventID(t *testing.T) {
 	s := testutil.NewStore(t)
 	eventID, callID, accountID := testutil.IDs(t, s)
 	evt := store.Event{
@@ -47,32 +31,29 @@ func TestInsertEventRejectsDuplicateEventID(t *testing.T) {
 		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
 	}
 
-	if err := s.InsertEvent(context.Background(), evt); err != nil {
-		t.Fatalf("first InsertEvent: %v", err)
+	if _, inserted, err := s.ProcessDelivery(context.Background(), evt); err != nil || !inserted {
+		t.Fatalf("first ProcessDelivery = inserted:%t err:%v", inserted, err)
 	}
-	if err := s.InsertEvent(context.Background(), evt); err == nil {
-		t.Fatal("duplicate event_id insert succeeded, want unique constraint error")
+	if _, inserted, err := s.ProcessDelivery(context.Background(), evt); err != nil || inserted {
+		t.Fatalf("duplicate ProcessDelivery = inserted:%t err:%v, want no-op", inserted, err)
 	}
 }
 
-func TestIncrementAccountStatsAccumulates(t *testing.T) {
+func TestProcessDeliveryUpdatesAccountStats(t *testing.T) {
 	s := testutil.NewStore(t)
-	_, _, accountID := testutil.IDs(t, s)
+	eventID, callID, accountID := testutil.IDs(t, s)
 	ctx := context.Background()
 
-	if err := s.IncrementAccountStats(ctx, accountID, 30); err != nil {
-		t.Fatalf("IncrementAccountStats: %v", err)
-	}
-	if err := s.IncrementAccountStats(ctx, accountID, 12); err != nil {
-		t.Fatalf("IncrementAccountStats: %v", err)
+	if _, inserted, err := s.ProcessDelivery(ctx, store.Event{EventID: eventID, CallID: callID, AccountID: accountID, Status: "completed", DurationSec: 42, Payload: []byte(`{}`)}); err != nil || !inserted {
+		t.Fatalf("ProcessDelivery = inserted:%t err:%v", inserted, err)
 	}
 
 	got, err := s.AccountStats(ctx, accountID)
 	if err != nil {
 		t.Fatalf("AccountStats: %v", err)
 	}
-	if got.CallCount != 2 || got.TotalDurationSec != 42 {
-		t.Fatalf("got %+v, want CallCount=2 TotalDurationSec=42", got)
+	if got.CallCount != 1 || got.TotalDurationSec != 42 {
+		t.Fatalf("got %+v, want CallCount=1 TotalDurationSec=42", got)
 	}
 }
 
@@ -86,8 +67,8 @@ func TestUpsertCallThenMarkRecordingProcessed(t *testing.T) {
 		Status: "completed", DurationSec: 10,
 		RecordingURL: "https://example.com/a.wav", Payload: []byte(`{}`),
 	}
-	if err := s.UpsertCall(ctx, evt); err != nil {
-		t.Fatalf("UpsertCall: %v", err)
+	if _, inserted, err := s.ProcessDelivery(ctx, evt); err != nil || !inserted {
+		t.Fatalf("ProcessDelivery = inserted:%t err:%v", inserted, err)
 	}
 	if err := s.MarkRecordingProcessed(ctx, callID); err != nil {
 		t.Fatalf("MarkRecordingProcessed: %v", err)
@@ -109,11 +90,11 @@ func TestClaimPendingRecordingCallIDsLeasesEachCallOnce(t *testing.T) {
 	secondCallID := firstCallID + "_second"
 	ctx := context.Background()
 	for _, callID := range []string{firstCallID, secondCallID} {
-		if err := s.UpsertCall(ctx, store.Event{
-			CallID: callID, AccountID: accountID, Status: "completed", DurationSec: 10,
-			RecordingURL: "https://example.com/" + callID + ".wav",
-		}); err != nil {
-			t.Fatalf("seed %s: %v", callID, err)
+		if _, inserted, err := s.ProcessDelivery(ctx, store.Event{
+			EventID: "evt_" + callID, CallID: callID, AccountID: accountID, Status: "completed", DurationSec: 10,
+			RecordingURL: "https://example.com/" + callID + ".wav", Payload: []byte(`{}`),
+		}); err != nil || !inserted {
+			t.Fatalf("seed %s: inserted:%t err:%v", callID, inserted, err)
 		}
 	}
 

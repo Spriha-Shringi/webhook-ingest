@@ -56,12 +56,12 @@ func TestWebhookStoresEventAndCall(t *testing.T) {
 		t.Fatalf("got %d, want 200", resp.StatusCode)
 	}
 
-	exists, err := st.EventExists(ctx, eventID)
-	if err != nil {
-		t.Fatalf("EventExists: %v", err)
+	var storedEvents int
+	if err := st.Pool().QueryRow(ctx, `SELECT count(*) FROM events WHERE event_id = $1`, eventID).Scan(&storedEvents); err != nil {
+		t.Fatalf("count stored events: %v", err)
 	}
-	if !exists {
-		t.Fatal("expected the event to be stored")
+	if storedEvents != 1 {
+		t.Fatalf("stored %d events, want 1", storedEvents)
 	}
 
 	var gotAccount string
@@ -196,11 +196,11 @@ func TestRecordingIsProcessedAfterWebhookAcknowledgement(t *testing.T) {
 func TestServiceRecoversRecordingLeftUnprocessedBeforeStartup(t *testing.T) {
 	st := testutil.NewStore(t)
 	eventID, callID, accountID := testutil.IDs(t, st)
-	if err := st.UpsertCall(context.Background(), store.Event{
+	if _, inserted, err := st.ProcessDelivery(context.Background(), store.Event{
 		EventID: eventID, CallID: callID, AccountID: accountID, Status: "completed", DurationSec: 143,
-		RecordingURL: "https://recordings.example.com/" + callID + ".wav",
-	}); err != nil {
-		t.Fatalf("seed unfinished recording: %v", err)
+		RecordingURL: "https://recordings.example.com/" + callID + ".wav", Payload: []byte(`{}`),
+	}); err != nil || !inserted {
+		t.Fatalf("seed unfinished recording: inserted:%t err:%v", inserted, err)
 	}
 
 	cfg := config.Load()
@@ -234,11 +234,11 @@ func TestServiceProcessesRecordingsWithBoundedWorkerPool(t *testing.T) {
 	const recordings = 8
 	for i := range recordings {
 		callID := fmt.Sprintf("%s_%d", firstCallID, i)
-		if err := st.UpsertCall(context.Background(), store.Event{
-			CallID: callID, AccountID: accountID, Status: "completed", DurationSec: 1,
-			RecordingURL: "https://recordings.example.com/" + callID + ".wav",
-		}); err != nil {
-			t.Fatalf("seed recording %d: %v", i, err)
+		if _, inserted, err := st.ProcessDelivery(context.Background(), store.Event{
+			EventID: "evt_" + callID, CallID: callID, AccountID: accountID, Status: "completed", DurationSec: 1,
+			RecordingURL: "https://recordings.example.com/" + callID + ".wav", Payload: []byte(`{}`),
+		}); err != nil || !inserted {
+			t.Fatalf("seed recording %d: inserted:%t err:%v", i, inserted, err)
 		}
 	}
 
@@ -270,8 +270,11 @@ func TestServiceProcessesRecordingsWithBoundedWorkerPool(t *testing.T) {
 func TestServiceLoadsDurableStatsAtStartup(t *testing.T) {
 	st := testutil.NewStore(t)
 	_, _, accountID := testutil.IDs(t, st)
-	if err := st.IncrementAccountStats(context.Background(), accountID, 42); err != nil {
-		t.Fatalf("seed stats: %v", err)
+	if _, inserted, err := st.ProcessDelivery(context.Background(), store.Event{
+		EventID: "evt_" + accountID, CallID: "call_" + accountID, AccountID: accountID,
+		Status: "completed", DurationSec: 42, Payload: []byte(`{}`),
+	}); err != nil || !inserted {
+		t.Fatalf("seed stats: inserted:%t err:%v", inserted, err)
 	}
 
 	cfg := config.Load()
