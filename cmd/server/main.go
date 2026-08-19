@@ -44,7 +44,6 @@ func main() {
 		log.Error("start ingestion service", "err", err)
 		os.Exit(1)
 	}
-	defer svc.Stop()
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.NewRouter(svc, log)}
 
 	go func() {
@@ -64,5 +63,8 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("shutdown", "err", err)
+	}
+	if err := svc.Stop(shutdownCtx); err != nil {
+		log.Error("stop recording worker", "err", err)
 	}
 }

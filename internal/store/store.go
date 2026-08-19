@@ -182,20 +182,30 @@ func (s *Store) UpsertCall(ctx context.Context, e Event) error {
 // MarkRecordingProcessed flags the call's recording as handled.
 func (s *Store) MarkRecordingProcessed(ctx context.Context, callID string) error {
 	_, err := s.pool.Exec(ctx,
-		`UPDATE calls SET recording_processed = TRUE, updated_at = now()
+		`UPDATE calls SET recording_processed = TRUE, recording_locked_at = NULL, updated_at = now()
 		 WHERE call_id = $1`, callID)
 	return err
 }
 
-// PendingRecordingCallIDs returns calls whose recording work survived an
-// earlier process exit and must be retried by the worker.
-func (s *Store) PendingRecordingCallIDs(ctx context.Context, limit int) ([]string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT call_id FROM calls
+// ClaimPendingRecordingCallIDs assigns a short durable lease to unfinished
+// recordings. SKIP LOCKED lets many workers and replicas claim distinct work.
+func (s *Store) ClaimPendingRecordingCallIDs(ctx context.Context, limit int) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `WITH candidates AS (
+		SELECT call_id
+		FROM calls
 		WHERE recording_processed = FALSE
 		  AND recording_url IS NOT NULL
 		  AND recording_url <> ''
+		  AND (recording_locked_at IS NULL OR recording_locked_at < now() - interval '5 minutes')
 		ORDER BY updated_at
-		LIMIT $1`, limit)
+		FOR UPDATE SKIP LOCKED
+		LIMIT $1
+	)
+	UPDATE calls
+	SET recording_locked_at = now()
+	FROM candidates
+	WHERE calls.call_id = candidates.call_id
+	RETURNING calls.call_id`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -210,6 +220,15 @@ func (s *Store) PendingRecordingCallIDs(ctx context.Context, limit int) ([]strin
 		callIDs = append(callIDs, callID)
 	}
 	return callIDs, rows.Err()
+}
+
+// ReleaseRecordingLease makes a failed or cancelled recording eligible for a
+// later retry without waiting for its lease to expire.
+func (s *Store) ReleaseRecordingLease(ctx context.Context, callID string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE calls
+		SET recording_locked_at = NULL
+		WHERE call_id = $1 AND recording_processed = FALSE`, callID)
+	return err
 }
 
 // IncrementAccountStats folds one completed call into the durable aggregate.

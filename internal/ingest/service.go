@@ -18,7 +18,7 @@ import (
 const (
 	recordingWork          = 50 * time.Millisecond
 	recordingRetryInterval = time.Second
-	recordingQueueSize     = 100
+	recordingWorkerCount   = 4
 )
 
 // Service ingests webhook deliveries.
@@ -31,6 +31,9 @@ type Service struct {
 	recordingCtx    context.Context
 	cancelRecording context.CancelFunc
 	recordingJobs   chan string
+	recordingWake   chan struct{}
+	stopRecordings  chan struct{}
+	stopOnce        sync.Once
 	workers         sync.WaitGroup
 }
 
@@ -56,20 +59,39 @@ func (s *Service) Start(ctx context.Context) error {
 	s.cache.Replace(totals)
 
 	s.recordingCtx, s.cancelRecording = context.WithCancel(context.Background())
-	s.recordingJobs = make(chan string, recordingQueueSize)
-	s.workers.Add(1)
-	go s.recordingWorker()
+	// An unbuffered channel limits leased work to active workers. Ingestion only
+	// signals recovery, so it remains fast even when recording work is busy.
+	s.recordingJobs = make(chan string)
+	s.recordingWake = make(chan struct{}, 1)
+	s.stopRecordings = make(chan struct{})
+	s.workers.Add(recordingWorkerCount + 1)
+	for range recordingWorkerCount {
+		go s.recordingWorker()
+	}
+	go s.recordingRecoveryLoop()
 	return nil
 }
 
-// Stop asks the recording worker to finish promptly. Calls not completed by
-// then remain marked unprocessed and will be recovered by the next process.
-func (s *Service) Stop() {
+// Stop stops leasing new recordings and drains active work until ctx expires.
+// If the deadline wins, released leases make unfinished work retryable.
+func (s *Service) Stop(ctx context.Context) error {
 	if s.cancelRecording == nil {
-		return
+		return nil
 	}
-	s.cancelRecording()
-	s.workers.Wait()
+	s.stopOnce.Do(func() { close(s.stopRecordings) })
+	done := make(chan struct{})
+	go func() {
+		s.workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		s.cancelRecording()
+		<-done
+		return ctx.Err()
+	}
 }
 
 // Stats returns the cached totals for an account.
@@ -110,10 +132,9 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
 		select {
-		case s.recordingJobs <- rec.CallID:
+		case s.recordingWake <- struct{}{}:
 		default:
-			// The durable scan will recover work if the in-memory queue is full.
-			s.log.Warn("recording queue full; will retry from database", "call_id", rec.CallID)
+			// A recovery pass is already scheduled.
 		}
 	}
 
@@ -133,37 +154,72 @@ func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
 
 func (s *Service) recordingWorker() {
 	defer s.workers.Done()
-	ticker := time.NewTicker(recordingRetryInterval)
-	defer ticker.Stop()
-
-	s.processPendingRecordings()
-	for {
-		select {
-		case <-s.recordingCtx.Done():
-			return
-		case callID := <-s.recordingJobs:
-			s.processOneRecording(callID)
-		case <-ticker.C:
-			s.processPendingRecordings()
+	for callID := range s.recordingJobs {
+		if s.recordingCtx.Err() != nil {
+			_ = s.store.ReleaseRecordingLease(context.Background(), callID)
+			continue
 		}
-	}
-}
-
-func (s *Service) processPendingRecordings() {
-	callIDs, err := s.store.PendingRecordingCallIDs(s.recordingCtx, recordingQueueSize)
-	if err != nil {
-		if s.recordingCtx.Err() == nil {
-			s.log.Error("list pending recordings", "err", err)
-		}
-		return
-	}
-	for _, callID := range callIDs {
 		s.processOneRecording(callID)
 	}
 }
 
+func (s *Service) recordingRecoveryLoop() {
+	defer s.workers.Done()
+	defer close(s.recordingJobs)
+	ticker := time.NewTicker(recordingRetryInterval)
+	defer ticker.Stop()
+
+	for {
+		claimed, keepRunning := s.claimAndQueueRecordings()
+		if !keepRunning {
+			return
+		}
+		if claimed == recordingWorkerCount {
+			// All workers received work, so claim the next batch immediately.
+			continue
+		}
+		select {
+		case <-s.stopRecordings:
+			return
+		case <-s.recordingCtx.Done():
+			return
+		case <-s.recordingWake:
+		case <-ticker.C:
+		}
+	}
+}
+
+// claimAndQueueRecordings leases a bounded batch and waits for workers to
+// accept it, avoiding an unbounded in-memory backlog of externally visible work.
+func (s *Service) claimAndQueueRecordings() (int, bool) {
+	callIDs, err := s.store.ClaimPendingRecordingCallIDs(s.recordingCtx, recordingWorkerCount)
+	if err != nil {
+		if s.recordingCtx.Err() == nil {
+			s.log.Error("claim pending recordings", "err", err)
+		}
+		return 0, s.recordingCtx.Err() == nil
+	}
+	for _, callID := range callIDs {
+		select {
+		case s.recordingJobs <- callID:
+		case <-s.stopRecordings:
+			_ = s.store.ReleaseRecordingLease(context.Background(), callID)
+			return 0, false
+		case <-s.recordingCtx.Done():
+			_ = s.store.ReleaseRecordingLease(context.Background(), callID)
+			return 0, false
+		}
+	}
+	return len(callIDs), true
+}
+
 func (s *Service) processOneRecording(callID string) {
-	if err := s.processRecording(s.recordingCtx, store.Event{CallID: callID}); err != nil && s.recordingCtx.Err() == nil {
-		s.log.Error("process recording", "call_id", callID, "err", err)
+	if err := s.processRecording(s.recordingCtx, store.Event{CallID: callID}); err != nil {
+		if releaseErr := s.store.ReleaseRecordingLease(context.Background(), callID); releaseErr != nil {
+			s.log.Error("release recording lease", "call_id", callID, "err", releaseErr)
+		}
+		if s.recordingCtx.Err() == nil {
+			s.log.Error("process recording", "call_id", callID, "err", err)
+		}
 	}
 }

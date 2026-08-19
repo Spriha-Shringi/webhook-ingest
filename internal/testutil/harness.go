@@ -76,7 +76,7 @@ func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
 	if err := svc.Start(context.Background()); err != nil {
 		t.Fatalf("start ingestion service: %v", err)
 	}
-	t.Cleanup(svc.Stop)
+	t.Cleanup(func() { _ = svc.Stop(context.Background()) })
 
 	srv := httptest.NewServer(httpapi.NewRouter(svc, log))
 	t.Cleanup(srv.Close)

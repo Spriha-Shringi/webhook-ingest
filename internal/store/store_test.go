@@ -102,3 +102,37 @@ func TestUpsertCallThenMarkRecordingProcessed(t *testing.T) {
 		t.Fatal("expected recording_processed to be true")
 	}
 }
+
+func TestClaimPendingRecordingCallIDsLeasesEachCallOnce(t *testing.T) {
+	s := testutil.NewStore(t)
+	_, firstCallID, accountID := testutil.IDs(t, s)
+	secondCallID := firstCallID + "_second"
+	ctx := context.Background()
+	for _, callID := range []string{firstCallID, secondCallID} {
+		if err := s.UpsertCall(ctx, store.Event{
+			CallID: callID, AccountID: accountID, Status: "completed", DurationSec: 10,
+			RecordingURL: "https://example.com/" + callID + ".wav",
+		}); err != nil {
+			t.Fatalf("seed %s: %v", callID, err)
+		}
+	}
+
+	first, err := s.ClaimPendingRecordingCallIDs(ctx, 1)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first claim = %v, %v; want one call", first, err)
+	}
+	second, err := s.ClaimPendingRecordingCallIDs(ctx, 1)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("second claim = %v, %v; want one different call", second, err)
+	}
+	if first[0] == second[0] {
+		t.Fatalf("same call %q was leased twice", first[0])
+	}
+	third, err := s.ClaimPendingRecordingCallIDs(ctx, 1)
+	if err != nil {
+		t.Fatalf("third claim: %v", err)
+	}
+	if len(third) != 0 {
+		t.Fatalf("third claim = %v, want no unleased calls", third)
+	}
+}

@@ -213,7 +213,7 @@ func TestServiceRecoversRecordingLeftUnprocessedBeforeStartup(t *testing.T) {
 	if err := svc.Start(context.Background()); err != nil {
 		t.Fatalf("start service: %v", err)
 	}
-	t.Cleanup(svc.Stop)
+	t.Cleanup(func() { _ = svc.Stop(context.Background()) })
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -226,6 +226,45 @@ func TestServiceRecoversRecordingLeftUnprocessedBeforeStartup(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("recording left by the previous process was not recovered")
+}
+
+func TestServiceProcessesRecordingsWithBoundedWorkerPool(t *testing.T) {
+	st := testutil.NewStore(t)
+	_, firstCallID, accountID := testutil.IDs(t, st)
+	const recordings = 8
+	for i := range recordings {
+		callID := fmt.Sprintf("%s_%d", firstCallID, i)
+		if err := st.UpsertCall(context.Background(), store.Event{
+			CallID: callID, AccountID: accountID, Status: "completed", DurationSec: 1,
+			RecordingURL: "https://recordings.example.com/" + callID + ".wav",
+		}); err != nil {
+			t.Fatalf("seed recording %d: %v", i, err)
+		}
+	}
+
+	cfg := config.Load()
+	rdb, err := redisclient.New(context.Background(), cfg.RedisAddr)
+	if err != nil {
+		t.Fatalf("connect redis: %v", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+	svc := ingest.New(st, stats.NewCache(), rdb, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatalf("start service: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Stop(context.Background()) })
+
+	deadline := time.Now().Add(750 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		var processed int
+		err := st.Pool().QueryRow(context.Background(),
+			`SELECT count(*) FROM calls WHERE account_id = $1 AND recording_processed = TRUE`, accountID).Scan(&processed)
+		if err == nil && processed == recordings {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("worker pool did not finish %d recordings before deadline", recordings)
 }
 
 func TestServiceLoadsDurableStatsAtStartup(t *testing.T) {
@@ -245,7 +284,7 @@ func TestServiceLoadsDurableStatsAtStartup(t *testing.T) {
 	if err := svc.Start(context.Background()); err != nil {
 		t.Fatalf("start service: %v", err)
 	}
-	t.Cleanup(svc.Stop)
+	t.Cleanup(func() { _ = svc.Stop(context.Background()) })
 
 	got := svc.Stats(accountID)
 	if got.CallCount != 1 || got.TotalDurationSec != 42 {
