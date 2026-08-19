@@ -73,6 +73,8 @@ func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := ingest.New(s, stats.NewCache(), rdb, log)
+	svc.Start()
+	t.Cleanup(svc.Stop)
 
 	srv := httptest.NewServer(httpapi.NewRouter(svc, log))
 	t.Cleanup(srv.Close)

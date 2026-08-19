@@ -3,12 +3,19 @@ package ingest_test
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/convin/webhook-ingest/internal/config"
+	"github.com/convin/webhook-ingest/internal/ingest"
+	"github.com/convin/webhook-ingest/internal/redisclient"
+	"github.com/convin/webhook-ingest/internal/stats"
+	"github.com/convin/webhook-ingest/internal/store"
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
@@ -151,4 +158,37 @@ func TestRecordingIsProcessedAfterWebhookAcknowledgement(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("recording was not marked processed after the webhook response")
+}
+
+func TestServiceRecoversRecordingLeftUnprocessedBeforeStartup(t *testing.T) {
+	st := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	if err := st.UpsertCall(context.Background(), store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID, Status: "completed", DurationSec: 143,
+		RecordingURL: "https://recordings.example.com/" + callID + ".wav",
+	}); err != nil {
+		t.Fatalf("seed unfinished recording: %v", err)
+	}
+
+	cfg := config.Load()
+	rdb, err := redisclient.New(context.Background(), cfg.RedisAddr)
+	if err != nil {
+		t.Fatalf("connect redis: %v", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+	svc := ingest.New(st, stats.NewCache(), rdb, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc.Start()
+	t.Cleanup(svc.Stop)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var processed bool
+		err := st.Pool().QueryRow(context.Background(),
+			`SELECT recording_processed FROM calls WHERE call_id = $1`, callID).Scan(&processed)
+		if err == nil && processed {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("recording left by the previous process was not recovered")
 }

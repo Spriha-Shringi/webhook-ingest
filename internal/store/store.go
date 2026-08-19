@@ -147,6 +147,31 @@ func (s *Store) MarkRecordingProcessed(ctx context.Context, callID string) error
 	return err
 }
 
+// PendingRecordingCallIDs returns calls whose recording work survived an
+// earlier process exit and must be retried by the worker.
+func (s *Store) PendingRecordingCallIDs(ctx context.Context, limit int) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT call_id FROM calls
+		WHERE recording_processed = FALSE
+		  AND recording_url IS NOT NULL
+		  AND recording_url <> ''
+		ORDER BY updated_at
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var callIDs []string
+	for rows.Next() {
+		var callID string
+		if err := rows.Scan(&callID); err != nil {
+			return nil, err
+		}
+		callIDs = append(callIDs, callID)
+	}
+	return callIDs, rows.Err()
+}
+
 // IncrementAccountStats folds one completed call into the durable aggregate.
 func (s *Store) IncrementAccountStats(ctx context.Context, accountID string, durationSec int) error {
 	_, err := s.pool.Exec(ctx,
