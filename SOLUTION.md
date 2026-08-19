@@ -1,27 +1,44 @@
 # Solution
 
-The duplicate-delivery check had a time-of-check/time-of-use race: concurrent
-requests could all see that an `event_id` was absent, then each insert an event
-and increment the account totals. There was also no unique database constraint
-to stop that race, and the event, call, and aggregate writes were separate
-operations, so a failure partway through could leave durable state inconsistent.
-Recording processing inherited the HTTP request context, which is cancelled
-after the response, discarded processing errors, and used only a goroutine;
-that explains both silently unprocessed recordings and work disappearing during
-deployments. Finally, cache writes were not synchronised and the in-memory
-stats cache started empty after a restart despite Postgres having the totals.
+## What was broken
 
-I chose Postgres as the idempotency authority. A unique `events.event_id`
-constraint, `INSERT ... ON CONFLICT DO NOTHING`, and a single transaction make
-the event, call, and aggregate change atomic. A duplicate delivery is therefore
-a successful no-op even when retries race across processes. I considered Redis
-locks or TTL-based deduplication, but Redis eviction, expiry, and process
-crashes make it unsuitable as the final correctness boundary. Redis can still
-be useful as an optimisation, but Postgres remains the durable source of truth.
+The duplicate check was a read-then-write race: concurrent retries could all
+observe a missing `event_id` and each update the aggregate. Even distinct events
+for a status or duration correction of the same `call_id` were counted as new
+calls, so `call_count` and total duration drifted from the current calls table.
+The fix uses one Postgres transaction: it inserts a delivery only once, locks
+the call while replacing its current state, and applies the resulting delta to
+the affected account totals. Existing affected databases retain duplicate raw
+events for audit, mark surplus copies inactive, and rebuild the derived totals
+from `calls` before enforcing active-event uniqueness.
 
-Recording recovery now scans persisted unfinished calls at startup and on a
-bounded interval; the worker uses its own lifecycle context and logs failures.
-At 10,000 webhooks per second, I would retain the database uniqueness
-constraint and transactional write, then partition the events table, move
-recording work to a durable outbox and horizontally scaled consumer fleet, and
-replace the per-process cache with a distributed cache or durable read model.
+Recording work used the request context after acknowledgement, ignored errors,
+and existed only in a goroutine. That caused silent failures and loss of
+in-flight work on deployment. Recording claims are now durable five-minute
+leases, acquired with `FOR UPDATE SKIP LOCKED`; replicas therefore do not work
+the same call. Four bounded workers process leased work concurrently, the
+recovery loop resumes unfinished work after restart, and shutdown stops new
+claims then drains active work until its deadline. The cache also lacked a
+write lock and started empty after restart; it is now synchronized and hydrated
+from durable `account_stats` at startup.
+
+## Why Postgres owns deduplication
+
+Postgres is already the durable source of truth. Its partial unique index and
+`INSERT ... ON CONFLICT DO NOTHING` remain correct through races, crashes, and
+multiple application replicas; the surrounding transaction keeps delivery,
+call, and aggregate changes consistent. Redis locks or TTL keys could improve
+throughput as an optional fast path, but eviction, expiration, and failure
+between Redis and Postgres make them insufficient as the final correctness
+boundary.
+
+## At 10,000 webhooks/second
+
+The current four-worker pool is deliberately bounded rather than unbounded; it
+is a safe baseline, not a 10,000/sec recording processor. At that scale I would
+keep the database idempotency constraint and transaction, partition the event
+table, and publish recording jobs through a transactional outbox to a durable
+queue. Horizontally scaled consumer fleets would then control recording
+concurrency independently of HTTP ingestion. I would also use a distributed
+stats read model or cache, shard hot aggregate writes, enforce backpressure,
+and instrument queue depth, lease age, duplicate rate, and failed retries.
