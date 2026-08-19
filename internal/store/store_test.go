@@ -39,6 +39,22 @@ func TestInsertEventThenExists(t *testing.T) {
 	}
 }
 
+func TestInsertEventRejectsDuplicateEventID(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
+	}
+
+	if err := s.InsertEvent(context.Background(), evt); err != nil {
+		t.Fatalf("first InsertEvent: %v", err)
+	}
+	if err := s.InsertEvent(context.Background(), evt); err == nil {
+		t.Fatal("duplicate event_id insert succeeded, want unique constraint error")
+	}
+}
+
 func TestIncrementAccountStatsAccumulates(t *testing.T) {
 	s := testutil.NewStore(t)
 	_, _, accountID := testutil.IDs(t, s)

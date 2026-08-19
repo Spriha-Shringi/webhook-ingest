@@ -101,7 +101,7 @@ func (s *Store) ProcessDelivery(ctx context.Context, e Event) (changes []StatsCh
 	var storedEventID string
 	err = tx.QueryRow(ctx, `INSERT INTO events (event_id, call_id, account_id, payload)
 		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (event_id) DO NOTHING
+		ON CONFLICT (event_id) WHERE deduplicated_at IS NULL DO NOTHING
 		RETURNING event_id`, e.EventID, e.CallID, e.AccountID, e.Payload).Scan(&storedEventID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
