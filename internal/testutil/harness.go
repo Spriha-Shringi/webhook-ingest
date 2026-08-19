@@ -73,7 +73,9 @@ func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := ingest.New(s, stats.NewCache(), rdb, log)
-	svc.Start()
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatalf("start ingestion service: %v", err)
+	}
 	t.Cleanup(svc.Stop)
 
 	srv := httptest.NewServer(httpapi.NewRouter(svc, log))

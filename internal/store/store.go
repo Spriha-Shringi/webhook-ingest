@@ -198,3 +198,24 @@ func (s *Store) AccountStats(ctx context.Context, accountID string) (Stats, erro
 	}
 	return st, nil
 }
+
+// AllAccountStats returns every durable account total for cache hydration.
+func (s *Store) AllAccountStats(ctx context.Context) (map[string]Stats, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT account_id, call_count, total_duration_sec FROM account_stats`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	totals := make(map[string]Stats)
+	for rows.Next() {
+		var accountID string
+		var total Stats
+		if err := rows.Scan(&accountID, &total.CallCount, &total.TotalDurationSec); err != nil {
+			return nil, err
+		}
+		totals[accountID] = total
+	}
+	return totals, rows.Err()
+}

@@ -41,11 +41,25 @@ func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *S
 
 // Start begins the durable recording worker. It is called after the service is
 // fully wired so a process restart immediately resumes unfinished work.
-func (s *Service) Start() {
+func (s *Service) Start(ctx context.Context) error {
+	durable, err := s.store.AllAccountStats(ctx)
+	if err != nil {
+		return err
+	}
+	totals := make(map[string]stats.AccountStats, len(durable))
+	for accountID, total := range durable {
+		totals[accountID] = stats.AccountStats{
+			CallCount:        total.CallCount,
+			TotalDurationSec: total.TotalDurationSec,
+		}
+	}
+	s.cache.Replace(totals)
+
 	s.recordingCtx, s.cancelRecording = context.WithCancel(context.Background())
 	s.recordingJobs = make(chan string, recordingQueueSize)
 	s.workers.Add(1)
 	go s.recordingWorker()
+	return nil
 }
 
 // Stop asks the recording worker to finish promptly. Calls not completed by

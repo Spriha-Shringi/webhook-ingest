@@ -177,7 +177,9 @@ func TestServiceRecoversRecordingLeftUnprocessedBeforeStartup(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = rdb.Close() })
 	svc := ingest.New(st, stats.NewCache(), rdb, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	svc.Start()
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatalf("start service: %v", err)
+	}
 	t.Cleanup(svc.Stop)
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -191,4 +193,29 @@ func TestServiceRecoversRecordingLeftUnprocessedBeforeStartup(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("recording left by the previous process was not recovered")
+}
+
+func TestServiceLoadsDurableStatsAtStartup(t *testing.T) {
+	st := testutil.NewStore(t)
+	_, _, accountID := testutil.IDs(t, st)
+	if err := st.IncrementAccountStats(context.Background(), accountID, 42); err != nil {
+		t.Fatalf("seed stats: %v", err)
+	}
+
+	cfg := config.Load()
+	rdb, err := redisclient.New(context.Background(), cfg.RedisAddr)
+	if err != nil {
+		t.Fatalf("connect redis: %v", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+	svc := ingest.New(st, stats.NewCache(), rdb, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatalf("start service: %v", err)
+	}
+	t.Cleanup(svc.Stop)
+
+	got := svc.Stats(accountID)
+	if got.CallCount != 1 || got.TotalDurationSec != 42 {
+		t.Fatalf("stats = %+v, want one 42-second call", got)
+	}
 }

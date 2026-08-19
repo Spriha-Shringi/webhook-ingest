@@ -40,7 +40,10 @@ func main() {
 	defer func() { _ = rdb.Close() }()
 
 	svc := ingest.New(st, stats.NewCache(), rdb, log)
-	svc.Start()
+	if err := svc.Start(ctx); err != nil {
+		log.Error("start ingestion service", "err", err)
+		os.Exit(1)
+	}
 	defer svc.Stop()
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.NewRouter(svc, log)}
 
