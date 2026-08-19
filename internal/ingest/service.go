@@ -95,7 +95,7 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	inserted, err := s.store.ProcessDelivery(ctx, rec)
+	changes, inserted, err := s.store.ProcessDelivery(ctx, rec)
 	if err != nil {
 		return err
 	}
@@ -103,7 +103,9 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
 		return nil
 	}
-	s.cache.Record(rec.AccountID, rec.DurationSec)
+	for _, change := range changes {
+		s.cache.Apply(change.AccountID, change.CallCountDelta, change.DurationSecDelta)
+	}
 
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {

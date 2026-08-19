@@ -37,6 +37,11 @@ func (c *Cache) Get(accountID string) AccountStats {
 
 // Record folds one completed call into an account's running totals.
 func (c *Cache) Record(accountID string, durationSec int) {
+	c.Apply(accountID, 1, int64(durationSec))
+}
+
+// Apply folds a durable aggregate change into the cached totals.
+func (c *Cache) Apply(accountID string, callCountDelta, durationDelta int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -45,8 +50,8 @@ func (c *Cache) Record(accountID string, durationSec int) {
 		s = &AccountStats{}
 		c.m[accountID] = s
 	}
-	s.CallCount++
-	s.TotalDurationSec += int64(durationSec)
+	s.CallCount += callCountDelta
+	s.TotalDurationSec += durationDelta
 }
 
 // Replace atomically seeds the cache from durable totals at service startup.

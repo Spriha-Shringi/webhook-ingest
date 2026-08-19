@@ -21,15 +21,19 @@ import (
 
 // eventJSON builds a well-formed call-completion payload.
 func eventJSON(eventID, callID, accountID string) string {
+	return eventJSONWithDuration(eventID, callID, accountID, 143)
+}
+
+func eventJSONWithDuration(eventID, callID, accountID string, durationSec int) string {
 	return fmt.Sprintf(`{
 	  "event_id":      %q,
 	  "call_id":       %q,
 	  "account_id":    %q,
 	  "status":        "completed",
-	  "duration_sec":  143,
+	  "duration_sec":  %d,
 	  "recording_url": "https://recordings.example.com/%s.wav",
 	  "occurred_at":   "2026-08-13T09:12:00Z"
-	}`, eventID, callID, accountID, callID)
+	}`, eventID, callID, accountID, durationSec, callID)
 }
 
 func post(t *testing.T, url, body string) *http.Response {
@@ -136,6 +140,35 @@ func TestConcurrentDuplicateDeliveriesAreCountedOnce(t *testing.T) {
 	}
 	if stats.CallCount != 1 || stats.TotalDurationSec != 143 {
 		t.Fatalf("stats = %+v, want one 143-second call", stats)
+	}
+}
+
+func TestCallCorrectionReplacesItsStatsContribution(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	firstEventID, callID, accountID := testutil.IDs(t, st)
+	secondEventID := firstEventID + "_correction"
+
+	if resp := post(t, srv.URL+"/webhooks/calls", eventJSONWithDuration(firstEventID, callID, accountID, 100)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("first delivery: got %d, want 200", resp.StatusCode)
+	}
+	if resp := post(t, srv.URL+"/webhooks/calls", eventJSONWithDuration(secondEventID, callID, accountID, 143)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("correction: got %d, want 200", resp.StatusCode)
+	}
+
+	var calls int
+	if err := st.Pool().QueryRow(context.Background(), `SELECT count(*) FROM calls WHERE call_id = $1`, callID).Scan(&calls); err != nil {
+		t.Fatalf("count calls: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("stored %d calls, want 1", calls)
+	}
+
+	got, err := st.AccountStats(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 143 {
+		t.Fatalf("stats = %+v, want one 143-second call", got)
 	}
 }
 

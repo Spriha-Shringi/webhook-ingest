@@ -28,6 +28,13 @@ type Stats struct {
 	TotalDurationSec int64
 }
 
+// StatsChange is one account-total adjustment made by a delivery.
+type StatsChange struct {
+	AccountID        string
+	CallCountDelta   int64
+	DurationSecDelta int64
+}
+
 // Store is a Postgres-backed repository.
 type Store struct {
 	pool *pgxpool.Pool
@@ -81,13 +88,13 @@ func (s *Store) InsertEvent(ctx context.Context, e Event) error {
 	return err
 }
 
-// ProcessDelivery atomically stores a new delivery, updates its call record,
-// and applies the matching aggregate increment. A duplicate event ID is an
-// acknowledged no-op and returns inserted=false.
-func (s *Store) ProcessDelivery(ctx context.Context, e Event) (inserted bool, err error) {
+// ProcessDelivery atomically stores a new delivery, updates the current state
+// of its call, and applies only the resulting aggregate delta. A duplicate
+// event ID is an acknowledged no-op and returns inserted=false.
+func (s *Store) ProcessDelivery(ctx context.Context, e Event) (changes []StatsChange, inserted bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -97,32 +104,65 @@ func (s *Store) ProcessDelivery(ctx context.Context, e Event) (inserted bool, er
 		ON CONFLICT (event_id) DO NOTHING
 		RETURNING event_id`, e.EventID, e.CallID, e.AccountID, e.Payload).Scan(&storedEventID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 
-	if _, err = tx.Exec(ctx, `INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
-		VALUES ($1, $2, $3, $4, $5, now())
-		ON CONFLICT (call_id) DO UPDATE SET
-			status = EXCLUDED.status,
-			duration_sec = EXCLUDED.duration_sec,
-			recording_url = EXCLUDED.recording_url,
-			updated_at = now()`, e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL); err != nil {
-		return false, err
+	// Serialize different event IDs for one call, including the first insert
+	// where SELECT ... FOR UPDATE alone has no row to lock yet.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, e.CallID); err != nil {
+		return nil, false, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO account_stats (account_id, call_count, total_duration_sec)
-		VALUES ($1, 1, $2)
-		ON CONFLICT (account_id) DO UPDATE SET
-			call_count = account_stats.call_count + 1,
-			total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`, e.AccountID, e.DurationSec); err != nil {
-		return false, err
+
+	var previousAccountID string
+	var previousDurationSec int
+	err = tx.QueryRow(ctx, `SELECT account_id, duration_sec FROM calls WHERE call_id = $1 FOR UPDATE`, e.CallID).
+		Scan(&previousAccountID, &previousDurationSec)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		if _, err = tx.Exec(ctx, `INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
+			VALUES ($1, $2, $3, $4, $5, now())`, e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL); err != nil {
+			return nil, false, err
+		}
+		changes = append(changes, StatsChange{AccountID: e.AccountID, CallCountDelta: 1, DurationSecDelta: int64(e.DurationSec)})
+	case err == nil:
+		if _, err = tx.Exec(ctx, `UPDATE calls SET account_id = $2, status = $3, duration_sec = $4,
+			recording_processed = CASE WHEN recording_url IS DISTINCT FROM $5 THEN FALSE ELSE recording_processed END,
+			recording_url = $5, updated_at = now() WHERE call_id = $1`,
+			e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL); err != nil {
+			return nil, false, err
+		}
+		if previousAccountID == e.AccountID {
+			changes = append(changes, StatsChange{AccountID: e.AccountID, DurationSecDelta: int64(e.DurationSec - previousDurationSec)})
+		} else {
+			changes = append(changes,
+				StatsChange{AccountID: previousAccountID, CallCountDelta: -1, DurationSecDelta: -int64(previousDurationSec)},
+				StatsChange{AccountID: e.AccountID, CallCountDelta: 1, DurationSecDelta: int64(e.DurationSec)},
+			)
+		}
+	default:
+		return nil, false, err
+	}
+
+	for _, change := range changes {
+		if change.CallCountDelta == 0 && change.DurationSecDelta == 0 {
+			continue
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (account_id) DO UPDATE SET
+				call_count = account_stats.call_count + EXCLUDED.call_count,
+				total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+			change.AccountID, change.CallCountDelta, change.DurationSecDelta); err != nil {
+			return nil, false, err
+		}
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return false, err
+		return nil, false, err
 	}
-	return true, nil
+	return changes, true, nil
 }
 
 // UpsertCall creates or refreshes the call record for this event.
